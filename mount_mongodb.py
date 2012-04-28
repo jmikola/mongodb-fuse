@@ -4,10 +4,13 @@ import stat
 import sys
 
 from bson.objectid import ObjectId
+from contextlib import contextmanager
 from pymongo.connection import Connection
 from time import time
 
 fuse.fuse_python_api = (0, 2)
+
+T_DB, T_COLL, T_ID, T_PROP = range(4)
 
 
 class MongoStat(fuse.Stat):
@@ -30,57 +33,74 @@ class MongoFuse(fuse.Fuse):
         self.host = "localhost"
         self.db = "test"
 
-    def getattr(self, path):
-        st = MongoStat()
-        pe = path.split('/')[1:]
+    def __parse_path(self, path):
+        """Returns a tuple of type, collection, object ID and property path"""
+        pe = path.strip('/').split('/', 2)
 
+        pathType, collName, objectId, propPath = (T_DB, None, None, None)
+
+        if '' != pe[0]:
+            pathType = T_COLL
+            collName = pe[0]
+
+        if 2 <= len(pe):
+            pathType = T_ID
+            objectId = ObjectId(pe[1])
+
+        if 3 == len(pe):
+            pathType = T_PROP
+            propPath = pe[2].replace('/', '.')
+
+        return (pathType, collName, objectId, propPath)
+
+    def getattr(self, path):
+        pathType, collName, objectId, propPath = self.__parse_path(path)
+        
+        st = MongoStat()
         st.st_atime = int(time())
         st.st_mtime = st.st_atime
         st.st_ctime = st.st_atime
 
-        if path == '/':
+        if T_DB == pathType or T_COLL == pathType:
             return st
-        elif len(pe) > 2:
-            return -errno.ENOENT
 
-        conn = Connection(host=self.host)
-        db = conn[self.db]
-        coll = db[pe[0]]
+        with open_db(self.host, self.db) as db:
+            if T_PROP == pathType:
+                doc = db[collName].find_one(spec={
+                    "_id": objectId,
+                    propPath: {"$exists": True},
+                    "fields": [propPath]
+                })
+            else:
+                doc = db[collName].find_one(spec_or_id=objectId)
 
-        if len(pe) == 2:
-            doc = coll.find_one(spec_or_id=ObjectId(pe[1]))
-
-            if doc != None:
+            if (doc != None):
                 st.st_mode = stat.S_IFREG | 0666
                 st.st_nlink = 1
                 st.st_size = sys.getsizeof(doc)
+                return st
             else:
-                conn.disconnect()
                 return -errno.ENOENT
 
-        conn.disconnect()
-        return st
-
     def readdir(self, path, offset):
-        pe = path.split('/')[1:]
+        pathType, collName, objectId, propPath = self.__parse_path(path)
         dirents = ['.', '..']
 
-        conn = Connection(host=self.host)
-        db = conn[self.db]
+        with open_db(host=self.host, db=self.db) as db:
+            if T_DB == pathType:
+                for name in db.collection_names():
+                    dirents.append(str(name))
+            elif T_COLL == pathType:
+                docs = db[collName].find(fields=['_id'])
+                for id in [doc['_id'] for doc in docs]:
+                    dirents.append(str(id))
+            elif T_ID == pathType:
+                doc = db[collName].find_one(spec_or_id=objectId)
+                for key, value in doc.items():
+                    dirents.append(str(key))
 
-        if path == '/':
-            for name in db.collection_names():
-                dirents.append(str(name))
-        elif len(pe) == 1:
-            coll = db[pe[0]]
-            docs = coll.find(fields=['_id'])
-            for id in [doc['_id'] for doc in docs]:
-                dirents.append(str(id))
-
-        conn.disconnect()
-
-        for r in dirents:
-            yield fuse.Direntry(r)
+        for dirent in dirents:
+            yield fuse.Direntry(dirent)
 
     def open(self, path, flags):
         return 0
@@ -104,6 +124,15 @@ class MongoFuse(fuse.Fuse):
         return 0
 
 
+@contextmanager
+def open_db(host, db):
+    conn = Connection(host)
+    try:
+        yield conn[db]
+    finally:
+        conn.disconnect()
+
+
 def main():
     usage = """
         mongodb-fuse: A FUSE wrapper for MongoDB
@@ -111,6 +140,7 @@ def main():
 
     server = MongoFuse(version="%prog " + fuse.__version__, usage=usage,
         dash_s_do='setsingle')
+
     server.parser.add_option(mountopt="host", metavar="HOSTNAME",
         default=server.host, help="MongoDB server host [default: %default]")
     server.parser.add_option(mountopt="db", metavar="DATABASE",
